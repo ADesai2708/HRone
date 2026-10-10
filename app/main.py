@@ -299,7 +299,30 @@ class EmployeeIn(BaseModel):
 
         return shift_end
 
+class PunchInRequest(BaseModel):
+    emp_code: str = Field(min_length=1, max_length=30)
+    punched_at: int | None = None
+    status: str = "PRESENT"
 
+    @field_validator("emp_code")
+    @classmethod
+    def validate_emp_code(cls, value: str) -> str:
+        value = value.strip()
+        if not value:
+            raise ValueError("Employee code cannot be empty")
+        return value
+
+    @field_validator("status")
+    @classmethod
+    def validate_status(cls, value: str) -> str:
+        allowed_statuses = {"PRESENT", "WFH", "ON_DUTY"}
+
+        if value not in allowed_statuses:
+            raise ValueError(
+                "Status must be PRESENT, WFH, or ON_DUTY"
+            )
+
+        return value
 @app.post("/employees", status_code=201)
 def create_employee(body: EmployeeIn):
     """Create a new employee."""
@@ -327,6 +350,90 @@ def create_employee(body: EmployeeIn):
 
     return response
 @app.get("/employees")
+@app.post("/attendance/punch-in", status_code=201)
+def punch_in(body: PunchInRequest):
+    # 1. Find the employee.
+    employee = db.employees.find_one(
+        {"emp_code": body.emp_code},
+        {"_id": 0},
+    )
+
+    if employee is None:
+        raise HTTPException(
+            status_code=404,
+            detail="Employee not found",
+        )
+
+    # 2. Determine the punch-in timestamp.
+    if body.punched_at is None:
+        punched_at = datetime.now(UTC)
+    else:
+        try:
+            punched_at = datetime.fromtimestamp(
+                body.punched_at / 1000,
+                tz=UTC,
+            )
+        except (ValueError, OverflowError, OSError):
+            raise HTTPException(
+                status_code=422,
+                detail="Invalid punch-in timestamp",
+            )
+
+    # 3. Truncate the timestamp to whole seconds.
+    punched_at = truncate_to_seconds(punched_at)
+
+    # 4. Resolve the attendance date using the employee's shift.
+    attendance_date = resolve_attendance_date(
+        punched_at,
+        employee["shift_start"],
+        employee["shift_end"],
+    )
+
+    attendance_date_str = attendance_date.isoformat()
+
+    # 5. Calculate late minutes.
+    late_minutes = compute_late_minutes(
+        punched_at,
+        employee["shift_start"],
+        employee["shift_end"],
+    )
+
+    # 6. Construct the attendance record.
+    record = {
+        "emp_code": body.emp_code,
+        "date": attendance_date_str,
+        "punch_in": punched_at,
+        "punch_out": None,
+        "status": body.status,
+        "late_minutes": late_minutes,
+        "work_hours": None,
+        "overtime_minutes": 0,
+        "half_day": False,
+        "history": [],
+    }
+
+    # 7. Insert the record. The unique index protects against races.
+    try:
+        db.attendance_logs.insert_one(record)
+    except DuplicateKeyError:
+        raise HTTPException(
+            status_code=409,
+            detail="Attendance already exists for this employee and date",
+        )
+
+    # 8. Return a clean API response without MongoDB's _id.
+    return {
+        "emp_code": body.emp_code,
+        "date": attendance_date_str,
+        "punch_in": int(punched_at.timestamp() * 1000),
+        "punch_out": None,
+        "status": body.status,
+        "late_minutes": late_minutes,
+        "work_hours": None,
+        "overtime_minutes": 0,
+        "half_day": False,
+        "history": [],
+    }
 def list_employees(
     department: str | None = None,
     page: int = Query(default=1, ge=1),
