@@ -125,36 +125,71 @@ def compute_overtime_minutes(
         return overtime_minutes
 
     return 0
-def compute_late_minutes(
-    punch_in: datetime,
-    shift_start: str,
-) -> int:
-    """Calculate late minutes using the 10-minute grace period."""
+def resolve_attendance_date(punch_in, shift_start, shift_end):
+    """
+    Determine the attendance date using IST.
 
-    # Convert the punch-in instant to Indian Standard Time.
+    For an overnight shift, a punch-in before the shift's end time
+    belongs to the previous day's shift.
+    """
+    local_punch_in = truncate_to_seconds(punch_in).astimezone(IST)
+
+    start_time = datetime.strptime(shift_start, "%H:%M").time()
+    end_time = datetime.strptime(shift_end, "%H:%M").time()
+
+    attendance_date = local_punch_in.date()
+
+    # An overnight shift ends on the following calendar day.
+    if end_time <= start_time:
+        punch_in_clock = (
+            local_punch_in.hour,
+            local_punch_in.minute,
+            local_punch_in.second,
+        )
+
+        shift_end_clock = (
+            end_time.hour,
+            end_time.minute,
+            0,
+        )
+
+        if punch_in_clock < shift_end_clock:
+            attendance_date -= timedelta(days=1)
+
+    return attendance_date
+
+
+def compute_late_minutes(punch_in, shift_start, shift_end):
+    """
+    Calculate late minutes using the shift's actual start date.
+
+    Lateness is counted only when the employee is more than
+    10 minutes late. The elapsed minutes are then rounded down.
+    """
+    punch_in = truncate_to_seconds(punch_in)
     local_punch_in = punch_in.astimezone(IST)
 
-    # Parse the shift start time.
-    hour, minute = map(int, shift_start.split(":"))
-
-    # Construct the shift start on the punch-in's local date.
-    shift_start_time = local_punch_in.replace(
-        hour=hour,
-        minute=minute,
-        second=0,
-        microsecond=0,
+    attendance_date = resolve_attendance_date(
+        punch_in,
+        shift_start,
+        shift_end,
     )
 
-    # Calculate the elapsed time in seconds.
+    start_time = datetime.strptime(shift_start, "%H:%M").time()
+
+    shift_start_datetime = datetime.combine(
+        attendance_date,
+        start_time,
+    ).replace(tzinfo=IST)
+
     elapsed_seconds = (
-        local_punch_in - shift_start_time
+        local_punch_in - shift_start_datetime
     ).total_seconds()
 
-    # Early arrivals and arrivals within the grace period are not late.
+    # Exactly 10 minutes late is not considered late.
     if elapsed_seconds <= 10 * 60:
         return 0
 
-    # Count only complete elapsed minutes.
     return int(elapsed_seconds // 60)
 def create_indexes():
     """Create required indexes safely and idempotently."""
