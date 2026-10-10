@@ -434,6 +434,89 @@ def punch_in(body: PunchInRequest):
         "half_day": False,
         "history": [],
     }
+@app.get("/attendance")
+def list_attendance(
+    emp_code: str | None = None,
+    date_from: str | None = None,
+    date_to: str | None = None,
+    status: str | None = None,
+    page: int = Query(default=1, ge=1),
+    page_size: int = Query(default=20, ge=1, le=100),
+):
+    # Build the MongoDB filter.
+    query = {}
+
+    if emp_code is not None:
+        query["emp_code"] = emp_code
+
+    if status is not None:
+        query["status"] = status
+
+    # Validate and apply the inclusive date range.
+    if date_from is not None:
+        try:
+            datetime.strptime(date_from, "%Y-%m-%d")
+        except ValueError:
+            raise HTTPException(
+                status_code=422,
+                detail="date_from must use YYYY-MM-DD format",
+            )
+
+        query.setdefault("date", {})
+        query["date"]["$gte"] = date_from
+
+    if date_to is not None:
+        try:
+            datetime.strptime(date_to, "%Y-%m-%d")
+        except ValueError:
+            raise HTTPException(
+                status_code=422,
+                detail="date_to must use YYYY-MM-DD format",
+            )
+
+        query.setdefault("date", {})
+        query["date"]["$lte"] = date_to
+
+    if (
+        date_from is not None
+        and date_to is not None
+        and date_from > date_to
+    ):
+        raise HTTPException(
+            status_code=422,
+            detail="date_from cannot be later than date_to",
+        )
+
+    # Count records after applying all filters.
+    total = db.attendance_logs.count_documents(query)
+
+    # Apply deterministic sorting and pagination.
+    skip = (page - 1) * page_size
+
+    items = list(
+        db.attendance_logs.find(query, {"_id": 0})
+        .sort([("date", -1), ("emp_code", 1)])
+        .skip(skip)
+        .limit(page_size)
+    )
+
+    # Convert stored UTC datetimes to epoch milliseconds.
+    for item in items:
+        for field in ("punch_in", "punch_out"):
+            timestamp = item.get(field)
+
+            if timestamp is not None:
+                if timestamp.tzinfo is None:
+                    timestamp = timestamp.replace(tzinfo=UTC)
+
+                item[field] = int(timestamp.timestamp() * 1000)
+
+    return {
+        "items": items,
+        "total": total,
+        "page": page,
+        "page_size": page_size,
+    }
 def list_employees(
     department: str | None = None,
     page: int = Query(default=1, ge=1),
