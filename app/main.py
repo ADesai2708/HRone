@@ -323,6 +323,19 @@ class PunchInRequest(BaseModel):
             )
 
         return value
+class PunchOutRequest(BaseModel):
+    emp_code: str = Field(min_length=1, max_length=30)
+    punched_at: int | None = None
+
+    @field_validator("emp_code")
+    @classmethod
+    def validate_emp_code(cls, value: str) -> str:
+        value = value.strip()
+
+        if not value:
+            raise ValueError("Employee code cannot be empty")
+
+        return value
 @app.post("/employees", status_code=201)
 def create_employee(body: EmployeeIn):
     """Create a new employee."""
@@ -517,6 +530,134 @@ def list_attendance(
         "page": page,
         "page_size": page_size,
     }
+@app.post("/attendance/punch-out")
+def punch_out(body: PunchOutRequest):
+    # 1. Verify that the employee exists.
+    employee = db.employees.find_one(
+        {"emp_code": body.emp_code},
+        {"_id": 0},
+    )
+
+    if employee is None:
+        raise HTTPException(
+            status_code=404,
+            detail="Employee not found",
+        )
+
+    # 2. Determine the punch-out timestamp.
+    if body.punched_at is None:
+        punched_at = datetime.now(UTC)
+    else:
+        try:
+            punched_at = datetime.fromtimestamp(
+                body.punched_at / 1000,
+                tz=UTC,
+            )
+        except (ValueError, OverflowError, OSError):
+            raise HTTPException(
+                status_code=422,
+                detail="Invalid punch-out timestamp",
+            )
+
+    # 3. Truncate to whole seconds.
+    punched_at = truncate_to_seconds(punched_at)
+
+    # 4. Find the most recent open attendance record.
+    attendance = db.attendance_logs.find_one(
+        {
+            "emp_code": body.emp_code,
+            "punch_in": {"$lte": punched_at},
+            "punch_out": None,
+            "status": {"$in": ["PRESENT", "WFH", "ON_DUTY"]},
+        },
+        sort=[("punch_in", -1)],
+    )
+
+    if attendance is None:
+        raise HTTPException(
+            status_code=404,
+            detail="No open attendance record found",
+        )
+
+    punch_in_time = attendance["punch_in"]
+
+    # PyMongo may return naive datetimes representing UTC.
+    if punch_in_time.tzinfo is None:
+        punch_in_time = punch_in_time.replace(tzinfo=UTC)
+
+    punch_in_time = truncate_to_seconds(punch_in_time)
+
+    # 5. Validate the punch-out timestamp.
+    duration_seconds = (
+        punched_at - punch_in_time
+    ).total_seconds()
+
+    if duration_seconds <= 0:
+        raise HTTPException(
+            status_code=422,
+            detail="Punch-out must be after punch-in",
+        )
+
+    if duration_seconds > 24 * 60 * 60:
+        raise HTTPException(
+            status_code=422,
+            detail="Punch-out cannot be more than 24 hours after punch-in",
+        )
+
+    # 6. Calculate derived attendance values.
+    work_hours = compute_work_hours(
+        punch_in_time,
+        punched_at,
+    )
+
+    overtime_minutes = compute_overtime_minutes(
+        punched_at,
+        employee["shift_start"],
+        employee["shift_end"],
+        attendance["date"],
+    )
+
+    half_day = compute_half_day(work_hours)
+
+    # 7. Atomically close the record.
+    # Only one concurrent request can update an open record.
+    result = db.attendance_logs.update_one(
+        {
+            "_id": attendance["_id"],
+            "punch_out": None,
+        },
+        {
+            "$set": {
+                "punch_out": punched_at,
+                "work_hours": work_hours,
+                "overtime_minutes": overtime_minutes,
+                "half_day": half_day,
+            }
+        },
+    )
+
+    if result.modified_count == 0:
+        raise HTTPException(
+            status_code=409,
+            detail="Attendance record has already been closed",
+        )
+
+    # 8. Return the updated record without MongoDB's internal ID.
+    updated = db.attendance_logs.find_one(
+        {"_id": attendance["_id"]},
+        {"_id": 0},
+    )
+
+    for field in ("punch_in", "punch_out"):
+        timestamp = updated.get(field)
+
+        if timestamp is not None:
+            if timestamp.tzinfo is None:
+                timestamp = timestamp.replace(tzinfo=UTC)
+
+            updated[field] = int(timestamp.timestamp() * 1000)
+
+    return updated
 def list_employees(
     department: str | None = None,
     page: int = Query(default=1, ge=1),
