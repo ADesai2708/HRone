@@ -1167,3 +1167,257 @@ def employee_monthly_analytics(
         "total_overtime_minutes": summary["total_overtime_minutes"],
         "attendance_pct": attendance_pct,
     }
+@app.get("/analytics/departments/summary")
+def department_summary(
+    year: int = Query(..., ge=2000, le=2100),
+    month: int = Query(..., ge=1, le=12),
+    department: str | None = None,
+):
+    # Determine the requested month's date range.
+    month_start = datetime(year, month, 1).date()
+
+    if month == 12:
+        next_month_start = datetime(year + 1, 1, 1).date()
+    else:
+        next_month_start = datetime(year, month + 1, 1).date()
+
+    month_end = next_month_start - timedelta(days=1)
+
+    # Employees who joined after the month ends are excluded.
+    employee_match = {
+        "joined_on": {"$lte": month_end.isoformat()}
+    }
+
+    if department is not None:
+        employee_match["department"] = department
+
+    pipeline = [
+        # Start with employees so employees without logs are retained.
+        {
+            "$match": employee_match
+        },
+        {
+            "$lookup": {
+                "from": "attendance_logs",
+                "let": {"employee_code": "$emp_code"},
+                "pipeline": [
+                    {
+                        "$match": {
+                            "$expr": {
+                                "$and": [
+                                    {
+                                        "$eq": [
+                                            "$emp_code",
+                                            "$$employee_code",
+                                        ]
+                                    },
+                                    {
+                                        "$gte": [
+                                            "$date",
+                                            month_start.isoformat(),
+                                        ]
+                                    },
+                                    {
+                                        "$lte": [
+                                            "$date",
+                                            month_end.isoformat(),
+                                        ]
+                                    },
+                                ]
+                            }
+                        }
+                    }
+                ],
+                "as": "attendance",
+            }
+        },
+        {
+            "$unwind": {
+                "path": "$attendance",
+                "preserveNullAndEmptyArrays": True,
+            }
+        },
+        {
+            "$group": {
+                "_id": "$department",
+                "headcount": {"$sum": 1},
+                "present_days": {
+                    "$sum": {
+                        "$cond": [
+                            {
+                                "$in": [
+                                    "$attendance.status",
+                                    ["PRESENT", "WFH", "ON_DUTY"],
+                                ]
+                            },
+                            {
+                                "$cond": [
+                                    {
+                                        "$eq": [
+                                            "$attendance.half_day",
+                                            True,
+                                        ]
+                                    },
+                                    0.5,
+                                    1,
+                                ]
+                            },
+                            0,
+                        ]
+                    }
+                },
+                "work_hours_sum": {
+                    "$sum": {
+                        "$cond": [
+                            {
+                                "$and": [
+                                    {
+                                        "$in": [
+                                            "$attendance.status",
+                                            ["PRESENT", "WFH", "ON_DUTY"],
+                                        ]
+                                    },
+                                    {
+                                        "$ne": [
+                                            "$attendance.work_hours",
+                                            None,
+                                        ]
+                                    },
+                                ]
+                            },
+                            "$attendance.work_hours",
+                            0,
+                        ]
+                    }
+                },
+                "work_hours_count": {
+                    "$sum": {
+                        "$cond": [
+                            {
+                                "$and": [
+                                    {
+                                        "$in": [
+                                            "$attendance.status",
+                                            ["PRESENT", "WFH", "ON_DUTY"],
+                                        ]
+                                    },
+                                    {
+                                        "$ne": [
+                                            "$attendance.work_hours",
+                                            None,
+                                        ]
+                                    },
+                                ]
+                            },
+                            1,
+                            0,
+                        ]
+                    }
+                },
+                "late_count": {
+                    "$sum": {
+                        "$cond": [
+                            {
+                                "$gt": [
+                                    "$attendance.late_minutes",
+                                    0,
+                                ]
+                            },
+                            1,
+                            0,
+                        ]
+                    }
+                },
+                "total_late_minutes": {
+                    "$sum": {
+                        "$ifNull": [
+                            "$attendance.late_minutes",
+                            0,
+                        ]
+                    }
+                },
+                "leave_count": {
+                    "$sum": {
+                        "$cond": [
+                            {
+                                "$eq": [
+                                    "$attendance.status",
+                                    "LEAVE",
+                                ]
+                            },
+                            1,
+                            0,
+                        ]
+                    }
+                },
+                "on_duty_count": {
+                    "$sum": {
+                        "$cond": [
+                            {
+                                "$eq": [
+                                    "$attendance.status",
+                                    "ON_DUTY",
+                                ]
+                            },
+                            1,
+                            0,
+                        ]
+                    }
+                },
+            }
+        },
+        # Omit departments with zero eligible employees.
+        {
+            "$match": {
+                "headcount": {"$gt": 0}
+            }
+        },
+        {
+            "$project": {
+                "_id": 0,
+                "department": "$_id",
+                "headcount": 1,
+                "present_days": 1,
+                "avg_work_hours": {
+                    "$cond": [
+                        {"$gt": ["$work_hours_count", 0]},
+                        {
+                            "$divide": [
+                                "$work_hours_sum",
+                                "$work_hours_count",
+                            ]
+                        },
+                        None,
+                    ]
+                },
+                "late_count": 1,
+                "total_late_minutes": 1,
+                "leave_count": 1,
+                "on_duty_count": 1,
+            }
+        },
+        {
+            "$sort": {
+                "department": 1
+            }
+        },
+    ]
+
+    results = list(db.employees.aggregate(pipeline))
+
+    # Apply the assignment's half-up rounding rules.
+    for item in results:
+        item["present_days"] = round_half_up(
+            item["present_days"], 2
+        )
+
+        if item["avg_work_hours"] is not None:
+            item["avg_work_hours"] = round_half_up(
+                item["avg_work_hours"], 2
+            )
+
+    return {
+        "year": year,
+        "month": month,
+        "items": results,
+    }
