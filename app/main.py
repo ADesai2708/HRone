@@ -1025,3 +1025,145 @@ def health():
 #   GET   /analytics/departments/{department}/trend
 #   GET   /admin/explain/{endpoint}
 # --------------------------------------------------------------------------- #
+@app.get("/analytics/employees/{emp_code}/monthly")
+def employee_monthly_analytics(
+    emp_code: str,
+    year: int = Query(..., ge=2000, le=2100),
+    month: int = Query(..., ge=1, le=12),
+):
+    # 1. Find the employee.
+    employee = db.employees.find_one(
+        {"emp_code": emp_code},
+        {"_id": 0},
+    )
+
+    if employee is None:
+        raise HTTPException(
+            status_code=404,
+            detail="Employee not found",
+        )
+
+    # 2. Determine the requested month's date range.
+    month_start = datetime(year, month, 1).date()
+
+    if month == 12:
+        next_month_start = datetime(year + 1, 1, 1).date()
+    else:
+        next_month_start = datetime(year, month + 1, 1).date()
+
+    month_end = next_month_start - timedelta(days=1)
+
+    # 3. Account for employees who joined during the month.
+    joined_on = datetime.strptime(
+        employee["joined_on"], "%Y-%m-%d"
+    ).date()
+
+    effective_start = max(month_start, joined_on)
+
+    # 4. Calculate working days (Monday-Friday).
+    working_days = 0
+    current_day = effective_start
+
+    while current_day <= month_end:
+        if current_day.weekday() < 5:
+            working_days += 1
+
+        current_day += timedelta(days=1)
+
+    # 5. Aggregate attendance records in MongoDB.
+    pipeline = [
+        {
+            "$match": {
+                "emp_code": emp_code,
+                "date": {
+                    "$gte": month_start.isoformat(),
+                    "$lte": month_end.isoformat(),
+                },
+            }
+        },
+        {
+            "$group": {
+                "_id": None,
+                "present_days": {
+                    "$sum": {
+                        "$cond": [
+                            {
+                                "$in": [
+                                    "$status",
+                                    ["PRESENT", "WFH", "ON_DUTY"],
+                                ]
+                            },
+                            {
+                                "$cond": [
+                                    {"$eq": ["$half_day", True]},
+                                    0.5,
+                                    1,
+                                ]
+                            },
+                            0,
+                        ]
+                    }
+                },
+                "leave_days": {
+                    "$sum": {
+                        "$cond": [
+                            {"$eq": ["$status", "LEAVE"]},
+                            1,
+                            0,
+                        ]
+                    }
+                },
+                "late_count": {
+                    "$sum": {
+                        "$cond": [
+                            {"$gt": ["$late_minutes", 0]},
+                            1,
+                            0,
+                        ]
+                    }
+                },
+                "total_late_minutes": {
+                    "$sum": {"$ifNull": ["$late_minutes", 0]}
+                },
+                "total_overtime_minutes": {
+                    "$sum": {"$ifNull": ["$overtime_minutes", 0]}
+                },
+            }
+        },
+    ]
+
+    result = list(db.attendance_logs.aggregate(pipeline))
+
+    # 6. Handle employees without attendance records.
+    if result:
+        summary = result[0]
+    else:
+        summary = {
+            "present_days": 0,
+            "leave_days": 0,
+            "late_count": 0,
+            "total_late_minutes": 0,
+            "total_overtime_minutes": 0,
+        }
+
+    # 7. Round numeric values according to the assignment.
+    present_days = round_half_up(summary["present_days"], 2)
+
+    attendance_pct = (
+        round_half_up((present_days / working_days) * 100, 4)
+        if working_days > 0
+        else None
+    )
+
+    return {
+        "emp_code": emp_code,
+        "year": year,
+        "month": month,
+        "working_days": working_days,
+        "present_days": present_days,
+        "leave_days": summary["leave_days"],
+        "late_count": summary["late_count"],
+        "total_late_minutes": summary["total_late_minutes"],
+        "total_overtime_minutes": summary["total_overtime_minutes"],
+        "attendance_pct": attendance_pct,
+    }
