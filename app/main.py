@@ -531,6 +531,315 @@ def list_attendance(
         "page_size": page_size,
     }
 @app.post("/attendance/punch-out")
+
+class AttendanceUpdateRequest(BaseModel):
+    status: str | None = None
+    punch_in: int | None = None
+    punch_out: int | None = None
+
+    @field_validator("status")
+    @classmethod
+    def validate_status(cls, value: str | None) -> str | None:
+        if value is not None:
+            allowed_statuses = {
+                "PRESENT",
+                "WFH",
+                "ON_DUTY",
+                "ABSENT",
+                "LEAVE",
+            }
+
+            if value not in allowed_statuses:
+                raise ValueError(
+                    "Status must be PRESENT, WFH, ON_DUTY, ABSENT, or LEAVE"
+                )
+
+        return value
+
+
+@app.patch("/attendance/{emp_code}/{date}")
+def regularize_attendance(
+    emp_code: str,
+    date: str,
+    body: AttendanceUpdateRequest,
+):
+    # 1. Validate the attendance date.
+    try:
+        parsed_date = datetime.strptime(date, "%Y-%m-%d").date()
+
+        if parsed_date.isoformat() != date:
+            raise ValueError
+
+    except ValueError:
+        raise HTTPException(
+            status_code=422,
+            detail="date must use YYYY-MM-DD format",
+        )
+
+    # 2. Find the employee.
+    employee = db.employees.find_one(
+        {"emp_code": emp_code},
+        {"_id": 0},
+    )
+
+    if employee is None:
+        raise HTTPException(
+            status_code=404,
+            detail="Employee not found",
+        )
+
+    # 3. Find the attendance record.
+    record = db.attendance_logs.find_one(
+        {"emp_code": emp_code, "date": date}
+    )
+
+    if record is None:
+        raise HTTPException(
+            status_code=404,
+            detail="Attendance record not found",
+        )
+
+    # 4. Extract the requested changes.
+    requested = body.model_dump(exclude_unset=True)
+
+    if not requested:
+        raise HTTPException(
+            status_code=422,
+            detail="At least one field must be provided",
+        )
+
+    allowed_statuses = {
+        "PRESENT",
+        "WFH",
+        "ON_DUTY",
+        "ABSENT",
+        "LEAVE",
+    }
+
+    requested_status = requested.get("status", record["status"])
+
+    if requested_status not in allowed_statuses:
+        raise HTTPException(
+            status_code=422,
+            detail="Invalid attendance status",
+        )
+
+    # 5. Convert supplied timestamps from epoch milliseconds to UTC.
+    def parse_timestamp(value, field_name):
+        if value is None:
+            return None
+
+        try:
+            parsed = datetime.fromtimestamp(value / 1000, tz=UTC)
+        except (ValueError, OverflowError, OSError):
+            raise HTTPException(
+                status_code=422,
+                detail=f"Invalid {field_name} timestamp",
+            )
+
+        return truncate_to_seconds(parsed)
+
+    new_punch_in = (
+        parse_timestamp(requested["punch_in"], "punch_in")
+        if "punch_in" in requested
+        else record.get("punch_in")
+    )
+
+    new_punch_out = (
+        parse_timestamp(requested["punch_out"], "punch_out")
+        if "punch_out" in requested
+        else record.get("punch_out")
+    )
+
+    if new_punch_in is not None and new_punch_in.tzinfo is None:
+        new_punch_in = new_punch_in.replace(tzinfo=UTC)
+
+    if new_punch_out is not None and new_punch_out.tzinfo is None:
+        new_punch_out = new_punch_out.replace(tzinfo=UTC)
+
+    # 6. ABSENT and LEAVE records cannot retain punch times.
+    if requested_status in {"ABSENT", "LEAVE"}:
+        if "punch_in" in requested and requested["punch_in"] is not None:
+            raise HTTPException(
+                status_code=422,
+                detail="ABSENT and LEAVE cannot have punch times",
+            )
+
+        if "punch_out" in requested and requested["punch_out"] is not None:
+            raise HTTPException(
+                status_code=422,
+                detail="ABSENT and LEAVE cannot have punch times",
+            )
+
+        new_punch_in = None
+        new_punch_out = None
+
+    # 7. Presence statuses require punch-in.
+    elif new_punch_in is None:
+        raise HTTPException(
+            status_code=422,
+            detail="Presence statuses require punch_in",
+        )
+
+    # 8. Punch-in must belong to the attendance date under R1.
+    if new_punch_in is not None:
+        local_punch_in = new_punch_in.astimezone(IST)
+
+        resolved_date = resolve_attendance_date(
+            new_punch_in,
+            employee["shift_start"],
+            employee["shift_end"],
+        )
+
+        if resolved_date.isoformat() != date:
+            raise HTTPException(
+                status_code=422,
+                detail="punch_in does not belong to the requested attendance date",
+            )
+
+    # 9. Validate the punch-out interval.
+    if new_punch_out is not None:
+        if new_punch_in is None:
+            raise HTTPException(
+                status_code=422,
+                detail="punch_out requires punch_in",
+            )
+
+        duration = (new_punch_out - new_punch_in).total_seconds()
+
+        if duration <= 0 or duration > 24 * 60 * 60:
+            raise HTTPException(
+                status_code=422,
+                detail="punch_out must be after punch_in and within 24 hours",
+            )
+
+    # 10. Recalculate derived fields.
+    if requested_status in {"ABSENT", "LEAVE"}:
+        new_late_minutes = 0
+        new_work_hours = None
+        new_overtime_minutes = 0
+        new_half_day = False
+    else:
+        new_late_minutes = compute_late_minutes(
+            new_punch_in,
+            employee["shift_start"],
+            employee["shift_end"],
+        )
+
+        if new_punch_out is not None:
+            new_work_hours = compute_work_hours(
+                new_punch_in,
+                new_punch_out,
+            )
+
+            new_overtime_minutes = compute_overtime_minutes(
+                new_punch_out,
+                employee["shift_start"],
+                employee["shift_end"],
+                date,
+            )
+
+            new_half_day = compute_half_day(new_work_hours)
+        else:
+            new_work_hours = None
+            new_overtime_minutes = 0
+            new_half_day = False
+
+    desired = {
+        "status": requested_status,
+        "punch_in": new_punch_in,
+        "punch_out": new_punch_out,
+        "late_minutes": new_late_minutes,
+        "work_hours": new_work_hours,
+        "overtime_minutes": new_overtime_minutes,
+        "half_day": new_half_day,
+    }
+
+    # 11. Determine which fields actually changed.
+    changes = {}
+
+    for field, new_value in desired.items():
+        old_value = record.get(field)
+
+        if old_value != new_value:
+            changes[field] = {
+                "old": old_value,
+                "new": new_value,
+            }
+
+    if not changes:
+        raise HTTPException(
+            status_code=422,
+            detail="The request does not change the attendance record",
+        )
+
+    # 12. Append one audit entry containing only changed fields.
+    history_entry = {
+        "changed_at": datetime.now(UTC).replace(microsecond=0),
+        "changes": changes,
+    }
+
+    update_fields = {
+        field: desired[field]
+        for field in changes
+    }
+
+    # 13. Use a conditional update to prevent silent concurrent overwrites.
+    result = db.attendance_logs.update_one(
+        {
+            "_id": record["_id"],
+            "history": record.get("history", []),
+            "status": record["status"],
+            "punch_in": record.get("punch_in"),
+            "punch_out": record.get("punch_out"),
+        },
+        {
+            "$set": update_fields,
+            "$push": {"history": history_entry},
+        },
+    )
+
+    if result.modified_count == 0:
+        raise HTTPException(
+            status_code=409,
+            detail="Attendance record changed concurrently; retry the request",
+        )
+
+    # 14. Return the updated record.
+    updated = db.attendance_logs.find_one(
+        {"_id": record["_id"]},
+        {"_id": 0},
+    )
+
+    for field in ("punch_in", "punch_out"):
+        timestamp = updated.get(field)
+
+        if timestamp is not None:
+            if timestamp.tzinfo is None:
+                timestamp = timestamp.replace(tzinfo=UTC)
+
+            updated[field] = int(timestamp.timestamp() * 1000)
+
+    for entry in updated.get("history", []):
+        changed_at = entry.get("changed_at")
+
+        if changed_at is not None:
+            if changed_at.tzinfo is None:
+                changed_at = changed_at.replace(tzinfo=UTC)
+
+            entry["changed_at"] = int(changed_at.timestamp() * 1000)
+
+        for change in entry.get("changes", {}).values():
+            for key in ("old", "new"):
+                value = change.get(key)
+
+                if isinstance(value, datetime):
+                    if value.tzinfo is None:
+                        value = value.replace(tzinfo=UTC)
+
+                    change[key] = int(value.timestamp() * 1000)
+
+    return updated
 def punch_out(body: PunchOutRequest):
     # 1. Verify that the employee exists.
     employee = db.employees.find_one(
