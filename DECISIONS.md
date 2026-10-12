@@ -1,7 +1,16 @@
-# DECISIONS.md  (about 150-200 words in total - plain language, your own words)
+# DECISIONS.md
 
-1. **Indexes.** Which indexes did you create, and which query or guarantee does each one serve? Which one did you consider and reject?
-2. **Punch-in race.** Two identical punch-in requests arrive at the same instant. Walk through exactly what happens in your code.
-3. **Ties.** Two employees are tied on late minutes at the cutoff of `limit`. What does your leaderboard return, and why?
-4. **Headcount.** How does your department summary make sure employees with zero logs are counted?
-5. **One thing you would change** if this had to serve 100x the data.
+## 1. Indexes
+I created a unique index on `employees.emp_code` to prevent duplicate employee codes. A unique compound index on `attendance_logs.emp_code` and `date` prevents duplicate daily attendance records. A date-and-employee index supports attendance listing and sorting. I rejected adding indexes for every filter because extra indexes increase storage and write costs.
+
+## 2. Punch-in race
+Two identical requests may both check that an employee exists. The unique compound index allows only one attendance record per employee and date. The successful request returns the created record; the duplicate request receives HTTP 409.
+
+## 3. Leaderboard ties
+Employees with equal late-minute totals share the same competition rank. Employee code provides deterministic ordering. The query includes everyone whose rank is within the requested limit, even when ties make the result longer than the limit.
+
+## 4. Headcount
+The department summary starts with employees who joined by the period's end and looks up their attendance. Employees without attendance logs remain included in headcount.
+
+## 5. Scaling to 100x data
+I would run realistic load tests, inspect execution plans, monitor query latency, and review index efficiency. If necessary, I would consider archival or partitioning after measuring the actual bottlenecks.
