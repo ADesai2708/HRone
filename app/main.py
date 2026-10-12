@@ -362,7 +362,6 @@ def create_employee(body: EmployeeIn):
     response["created_at"] = int(created_at.timestamp() * 1000)
 
     return response
-@app.get("/employees")
 @app.post("/attendance/punch-in", status_code=201)
 def punch_in(body: PunchInRequest):
     # 1. Find the employee.
@@ -967,6 +966,7 @@ def punch_out(body: PunchOutRequest):
             updated[field] = int(timestamp.timestamp() * 1000)
 
     return updated
+@app.get("/employees")
 def list_employees(
     department: str | None = None,
     page: int = Query(default=1, ge=1),
