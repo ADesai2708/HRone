@@ -1085,34 +1085,57 @@ def employee_monthly_analytics(
             "$group": {
                 "_id": None,
                 "present_days": {
-                    "$sum": {
-                        "$cond": [
-                            {
-                                "$in": [
-                                    "$status",
-                                    ["PRESENT", "WFH", "ON_DUTY"],
-                                ]
-                            },
-                            {
-                                "$cond": [
-                                    {"$eq": ["$half_day", True]},
-                                    0.5,
-                                    1,
-                                ]
-                            },
-                            0,
+    "$sum": {
+        "$cond": [
+            {
+                "$and": [
+                    {
+                        "$in": [
+                            "$status",
+                            ["PRESENT", "WFH", "ON_DUTY"],
                         ]
-                    }
-                },
-                "leave_days": {
-                    "$sum": {
-                        "$cond": [
-                            {"$eq": ["$status", "LEAVE"]},
-                            1,
-                            0,
+                    },
+                    {
+                        "$lte": [
+                            {
+                                "$dayOfWeek": {
+                                    "$dateFromString": {
+                                        "dateString": "$date",
+                                        "format": "%Y-%m-%d",
+                                        "timezone": "UTC",
+                                    }
+                                }
+                            },
+                            6,
                         ]
-                    }
-                },
+                    },
+                    {
+                        "$gte": [
+                            {
+                                "$dayOfWeek": {
+                                    "$dateFromString": {
+                                        "dateString": "$date",
+                                        "format": "%Y-%m-%d",
+                                        "timezone": "UTC",
+                                    }
+                                }
+                            },
+                            2,
+                        ]
+                    },
+                ]
+            },
+            {
+                "$cond": [
+                    {"$eq": [{"$ifNull": ["$half_day", False]}, True]},
+                    0.5,
+                    1,
+                ]
+            },
+            0,
+        ]
+    }
+},
                 "late_count": {
                     "$sum": {
                         "$cond": [
@@ -1698,31 +1721,86 @@ def department_trend(
         "late_count": 1,
     }
 },
-        {"$sort": {"date": 1}},
         {
-            "$densify": {
-                "field": "date",
-                "range": {
-                    "step": 1,
-                    "unit": "day",
-                    "bounds": [
-                        datetime.combine(
-                            start_date,
-                            datetime.min.time(),
-                            tzinfo=UTC,
-                        ),
-                        datetime.combine(
-                            end_date + timedelta(days=1),
-                            datetime.min.time(),
-                            tzinfo=UTC,
-                        ),
-                    ],
-                },
-            }
+    "$unionWith": {
+        "coll": "employees",
+        "pipeline": [
+            {"$match": {"department": department}},
+            {"$limit": 1},
+            {
+                "$project": {
+                    "_id": 0,
+                    "date": {
+                        "$map": {
+                            "input": {"$range": [0, day_count]},
+                            "as": "offset",
+                            "in": {
+                                "$dateAdd": {
+                                    "startDate": datetime.combine(
+                                        start_date,
+                                        datetime.min.time(),
+                                        tzinfo=timezone.utc,
+                                    ),
+                                    "unit": "day",
+                                    "amount": "$$offset",
+                                }
+                            },
+                        }
+                    },
+                }
+            },
+            {"$unwind": "$date"},
+            {
+                "$project": {
+                    "_id": 0,
+                    "date": 1,
+                    "present_count": {"$literal": 0},
+                    "late_count": {"$literal": 0},
+                }
+            },
+        ],
+    }
+},
+{
+    "$group": {
+        "_id": "$date",
+        "present_count": {"$sum": {"$ifNull": ["$present_count", 0]}},
+        "late_count": {"$sum": {"$ifNull": ["$late_count", 0]}},
+    }
+},
+{
+    "$project": {
+        "_id": 0,
+        "date": "$_id",
+        "present_count": 1,
+        "late_count": 1,
+    }
+},
+{"$sort": {"date": 1}},
+{
+    "$densify": {
+        "field": "date",
+        "range": {
+            "step": 1,
+            "unit": "day",
+            "bounds": [
+                datetime.combine(
+                    start_date,
+                    datetime.min.time(),
+                    tzinfo=timezone.utc,
+                ),
+                datetime.combine(
+                    end_date + timedelta(days=1),
+                    datetime.min.time(),
+                    tzinfo=timezone.utc,
+                ),
+            ],
         },
-        {"$sort": {"date": 1}},
-        {
-            "$set": {
+    }
+},
+{"$sort": {"date": 1}},
+{
+    "$set": {
                 "present_count": {"$ifNull": ["$present_count", 0]},
                 "late_count": {"$ifNull": ["$late_count", 0]},
                 "is_working_day": {
