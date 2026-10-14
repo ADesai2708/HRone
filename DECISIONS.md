@@ -13,4 +13,4 @@ Employees with equal late-minute totals share the same competition rank. Employe
 The department summary starts with employees who joined by the period's end and looks up their attendance. Employees without attendance logs remain included in headcount.
 
 ## 5. Scaling to 100x data
-I would run realistic load tests, inspect execution plans, monitor query latency, and review index efficiency. If necessary, I would consider archival or partitioning after measuring the actual bottlenecks.
+I would load-test, inspect execution plans, monitor latency, and review index efficiency. If needed, I would consider archival or partitioning after measuring bottlenecks.
