@@ -1,7 +1,7 @@
 # DECISIONS.md
 
 ## 1. Indexes
-I created a unique index on `employees.emp_code` to prevent duplicate employee codes. A unique compound index on `attendance_logs.emp_code` and `date` prevents duplicate daily attendance records. A date-and-employee index supports attendance listing and sorting. I rejected adding indexes for every filter because extra indexes increase storage and write costs.
+I created a unique index on `employees.emp_code` to prevent duplicate employee codes and a department index to support department filtering. A unique compound index on `attendance_logs.emp_code` and `date` prevents duplicate daily attendance records. A date-and-employee index supports attendance listing and sorting. I rejected adding indexes for every filter because extra indexes increase storage and write costs.
 
 ## 2. Punch-in race
 Two identical requests may both check that an employee exists. The unique compound index allows only one attendance record per employee and date. The successful request returns the created record; the duplicate request receives HTTP 409.
